@@ -70,7 +70,7 @@ const AD_MARKERS: ReadonlyArray<string> = [
   "[promo]", "[promotion]", "[anzeige]", "[reklame]",
 ];
 
-interface YtDlpInfo {
+export interface YtDlpInfo {
   title?: string;
   uploader?: string;
   channel?: string;
@@ -131,7 +131,7 @@ async function fetchVideoInfo(url: string): Promise<YtDlpInfo> {
  * single CaptionTrack[]. Manual entries take precedence when the same
  * language code appears in both.
  */
-function extractCaptionTracks(info: YtDlpInfo): CaptionTrack[] {
+export function extractCaptionTracks(info: YtDlpInfo): CaptionTrack[] {
   const tracks: CaptionTrack[] = [];
   const seen = new Set<string>();
 
@@ -157,7 +157,7 @@ function extractCaptionTracks(info: YtDlpInfo): CaptionTrack[] {
  * comes from the chapter's own end_time, or the next chapter's start, or a
  * 5-minute fallback for a trailing ad chapter.
  */
-function extractAdChapters(info: YtDlpInfo): AdChapter[] {
+export function extractAdChapters(info: YtDlpInfo): AdChapter[] {
   const chapters = info.chapters || [];
   const adChapters: AdChapter[] = [];
 
@@ -189,7 +189,7 @@ function shorten(value: number): string {
   return String(value);
 }
 
-function extractMetadata(info: YtDlpInfo): VideoMetadata {
+export function extractMetadata(info: YtDlpInfo): VideoMetadata {
   const subs =
     typeof info.channel_follower_count === "number"
       ? shorten(info.channel_follower_count)
