@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -11,6 +14,8 @@ import {
   CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import { getSubtitles, AdChapter, CaptionTrack } from './youtube-fetcher.js';
+
+const execFile = promisify(execFileCallback);
 
 // Define tool configurations
 const TOOLS: Tool[] = [
@@ -352,10 +357,44 @@ class TranscriptServer {
   }
 }
 
+/**
+ * Verify that yt-dlp is on the user's PATH before we try to use it.
+ * Writes a clear, actionable error to stderr and exits non-zero if missing,
+ * so the failure surfaces in the host's MCP log instead of as an opaque
+ * tool-call error per request.
+ */
+async function checkYtDlp(): Promise<void> {
+  try {
+    await execFile("yt-dlp", ["--version"], { timeout: 5000 });
+  } catch {
+    const lines = [
+      "",
+      "─────────────────────────────────────────────────────────────",
+      "  ERROR: yt-dlp not found on PATH",
+      "─────────────────────────────────────────────────────────────",
+      "",
+      "  This MCP server requires yt-dlp to be installed locally.",
+      "  Install it with one of:",
+      "",
+      "    macOS:    brew install yt-dlp",
+      "    Windows:  winget install yt-dlp.yt-dlp",
+      "    Linux:    pipx install yt-dlp",
+      "",
+      "  After installing, verify with: yt-dlp --version",
+      "─────────────────────────────────────────────────────────────",
+      "",
+    ];
+    for (const line of lines) console.error(line);
+    process.exit(1);
+  }
+}
+
 // Main execution
 async function main() {
+  await checkYtDlp();
+
   const server = new TranscriptServer();
-  
+
   try {
     await server.start();
   } catch (error) {
