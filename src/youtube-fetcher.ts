@@ -68,7 +68,19 @@ const AD_MARKERS: ReadonlyArray<string> = [
   "(promo)", "(promotion)", "(anzeige)", "(reklame)",
   "[werbung]", "[ad]", "[ads]", "[sponsor]", "[sponsored]",
   "[promo]", "[promotion]", "[anzeige]", "[reklame]",
+  // SponsorBlock-injected chapters from `yt-dlp --sponsorblock-mark`. The
+  // injected titles look like `[SponsorBlock]: Sponsor`,
+  // `[SponsorBlock]: Unpaid/Self Promotion`, etc. — the `[SponsorBlock]`
+  // prefix is the consistent token, lowercased here for the includes() check.
+  "[sponsorblock]",
 ];
+
+// SponsorBlock categories we ask yt-dlp to mark when strip_ads is true.
+// `sponsor` covers paid promotions; `selfpromo` covers the creator's own
+// merch / Patreon / channel pitches. We deliberately leave out `intro`,
+// `outro`, `interaction`, `preview`, `music_offtopic`, and `filler` — those
+// are useful context, not advertising.
+const SPONSORBLOCK_CATEGORIES = "sponsor,selfpromo";
 
 export interface YtDlpInfo {
   title?: string;
@@ -103,15 +115,30 @@ function describeYtDlpError(err: unknown): string {
 
 /**
  * Run `yt-dlp -J --skip-download URL` and parse the metadata JSON.
+ *
+ * When `useSponsorBlock` is true, also pass `--sponsorblock-mark <cats>` so
+ * SponsorBlock-detected segments are injected into the JSON's `chapters`
+ * array. The injected entries are titled `[SponsorBlock]: <Category>` and
+ * are matched by the existing AD_MARKERS list, so callers don't need to
+ * branch on the data source — sponsor-segment removal works uniformly
+ * whether the chapters come from the creator or from SponsorBlock.
  */
-async function fetchVideoInfo(url: string): Promise<YtDlpInfo> {
+async function fetchVideoInfo(
+  url: string,
+  useSponsorBlock = false,
+): Promise<YtDlpInfo> {
+  const args = ["-J", "--skip-download"];
+  if (useSponsorBlock) {
+    args.push("--sponsorblock-mark", SPONSORBLOCK_CATEGORIES);
+  }
+  args.push(url);
+
   let stdout: string;
   try {
-    const result = await execFile(
-      "yt-dlp",
-      ["-J", "--skip-download", url],
-      { timeout: YT_DLP_TIMEOUT_MS, maxBuffer: YT_DLP_MAX_BUFFER },
-    );
+    const result = await execFile("yt-dlp", args, {
+      timeout: YT_DLP_TIMEOUT_MS,
+      maxBuffer: YT_DLP_MAX_BUFFER,
+    });
     stdout = result.stdout;
   } catch (err) {
     throw new Error(`yt-dlp metadata fetch failed: ${describeYtDlpError(err)}`);
@@ -232,13 +259,25 @@ export async function getAvailableLanguages(
  *
  * If the requested language is not available and `enableFallback` is true,
  * tries English first, then falls back to the first available language.
+ *
+ * When `useSponsorBlock` is true, the metadata fetch also queries
+ * SponsorBlock so its segments appear as chapters and the existing
+ * ad-stripping path can filter them out. The flag is opt-in (the caller
+ * passes the user's `strip_ads` preference) so users who decline ad
+ * filtering don't trigger a third-party network call to sponsor.ajay.app.
  */
 export async function getSubtitles(options: {
   videoID: string;
   lang?: string;
   enableFallback?: boolean;
+  useSponsorBlock?: boolean;
 }): Promise<SubtitleResult> {
-  const { videoID, lang = "en", enableFallback = true } = options;
+  const {
+    videoID,
+    lang = "en",
+    enableFallback = true,
+    useSponsorBlock = false,
+  } = options;
 
   if (!videoID || typeof videoID !== "string") {
     throw new Error("Invalid video ID: must be a non-empty string");
@@ -247,7 +286,7 @@ export async function getSubtitles(options: {
   const url = `https://www.youtube.com/watch?v=${videoID}`;
 
   // Stage 1 — metadata, chapters, available subs.
-  const info = await fetchVideoInfo(url);
+  const info = await fetchVideoInfo(url, useSponsorBlock);
   const availableLanguages = extractCaptionTracks(info);
   const adChapters = extractAdChapters(info);
   const metadata = extractMetadata(info);

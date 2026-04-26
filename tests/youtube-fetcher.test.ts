@@ -123,6 +123,32 @@ describe("extractAdChapters", () => {
     assert.equal(ads[1].endMs, 660_000);
   });
 
+  it("recognizes SponsorBlock-injected chapters", () => {
+    // When the fetcher passes --sponsorblock-mark to yt-dlp, segments from
+    // SponsorBlock arrive in the chapters array with titles like
+    // "[SponsorBlock]: Sponsor" / "[SponsorBlock]: Unpaid/Self Promotion".
+    // The matcher should pick them up the same way as creator-added markers.
+    const info: YtDlpInfo = {
+      chapters: [
+        { start_time: 0, end_time: 30, title: "Intro" },
+        { start_time: 30, end_time: 60, title: "[SponsorBlock]: Sponsor" },
+        { start_time: 60, end_time: 600, title: "Main content" },
+        {
+          start_time: 600,
+          end_time: 660,
+          title: "[SponsorBlock]: Unpaid/Self Promotion",
+        },
+        { start_time: 660, end_time: 700, title: "Outro" },
+      ],
+    };
+    const ads = extractAdChapters(info);
+    assert.equal(ads.length, 2);
+    assert.equal(ads[0].startMs, 30_000);
+    assert.equal(ads[0].endMs, 60_000);
+    assert.equal(ads[1].startMs, 600_000);
+    assert.equal(ads[1].endMs, 660_000);
+  });
+
   it("does not match ad-marker substrings without surrounding parens/brackets", () => {
     // The marker list requires parens/brackets — bare 'ad' inside a regular
     // word like "advice" must not trigger the filter.

@@ -143,6 +143,9 @@ class YouTubeTranscriptExtractor {
         videoID: videoId,
         lang: lang,
         enableFallback: true,
+        // Only opt in to SponsorBlock when the user wants ad-stripping —
+        // otherwise we'd hit a third-party server for nothing.
+        useSponsorBlock: stripAds,
       });
 
       let lines = result.lines;
