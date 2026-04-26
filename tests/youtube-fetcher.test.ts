@@ -5,6 +5,7 @@ import {
   extractAdChapters,
   extractCaptionTracks,
   extractMetadata,
+  parseSponsorBlockResponse,
   YtDlpInfo,
 } from "../src/youtube-fetcher.ts";
 
@@ -123,32 +124,6 @@ describe("extractAdChapters", () => {
     assert.equal(ads[1].endMs, 660_000);
   });
 
-  it("recognizes SponsorBlock-injected chapters", () => {
-    // When the fetcher passes --sponsorblock-mark to yt-dlp, segments from
-    // SponsorBlock arrive in the chapters array with titles like
-    // "[SponsorBlock]: Sponsor" / "[SponsorBlock]: Unpaid/Self Promotion".
-    // The matcher should pick them up the same way as creator-added markers.
-    const info: YtDlpInfo = {
-      chapters: [
-        { start_time: 0, end_time: 30, title: "Intro" },
-        { start_time: 30, end_time: 60, title: "[SponsorBlock]: Sponsor" },
-        { start_time: 60, end_time: 600, title: "Main content" },
-        {
-          start_time: 600,
-          end_time: 660,
-          title: "[SponsorBlock]: Unpaid/Self Promotion",
-        },
-        { start_time: 660, end_time: 700, title: "Outro" },
-      ],
-    };
-    const ads = extractAdChapters(info);
-    assert.equal(ads.length, 2);
-    assert.equal(ads[0].startMs, 30_000);
-    assert.equal(ads[0].endMs, 60_000);
-    assert.equal(ads[1].startMs, 600_000);
-    assert.equal(ads[1].endMs, 660_000);
-  });
-
   it("does not match ad-marker substrings without surrounding parens/brackets", () => {
     // The marker list requires parens/brackets — bare 'ad' inside a regular
     // word like "advice" must not trigger the filter.
@@ -234,5 +209,95 @@ describe("extractMetadata", () => {
   it("does not pretend to format a malformed upload_date", () => {
     const meta = extractMetadata({ upload_date: "not-a-date" });
     assert.equal(meta.publishDate, "");
+  });
+});
+
+describe("parseSponsorBlockResponse", () => {
+  it("returns [] for non-array input", () => {
+    assert.deepEqual(parseSponsorBlockResponse(null), []);
+    assert.deepEqual(parseSponsorBlockResponse(undefined), []);
+    assert.deepEqual(parseSponsorBlockResponse({}), []);
+    assert.deepEqual(parseSponsorBlockResponse("not json"), []);
+  });
+
+  it("returns [] for an empty array (404-equivalent payload)", () => {
+    assert.deepEqual(parseSponsorBlockResponse([]), []);
+  });
+
+  it("parses the real SponsorBlock payload reported for KFisvc-AMII", () => {
+    // Verbatim shape returned by sponsor.ajay.app for the field-bug video.
+    const payload = [
+      {
+        category: "sponsor",
+        actionType: "skip",
+        segment: [86.757, 159.293],
+        UUID: "a336…",
+        videoDuration: 2654.061,
+        locked: 0,
+        votes: 1,
+        description: "",
+      },
+      {
+        category: "sponsor",
+        actionType: "skip",
+        segment: [1572.689, 1645.442],
+        UUID: "6a8f…",
+        videoDuration: 2654.061,
+        locked: 0,
+        votes: 1,
+        description: "",
+      },
+    ];
+    const ads = parseSponsorBlockResponse(payload);
+    assert.equal(ads.length, 2);
+    assert.equal(ads[0].title, "[SponsorBlock]: sponsor");
+    assert.equal(ads[0].startMs, 86_757);
+    assert.equal(ads[0].endMs, 159_293);
+    assert.equal(ads[1].startMs, 1_572_689);
+    assert.equal(ads[1].endMs, 1_645_442);
+  });
+
+  it("filters out non-ad action types (poi, chapter, full)", () => {
+    const payload = [
+      { category: "poi_highlight", actionType: "poi", segment: [10, 20] },
+      { category: "exclusive_access", actionType: "chapter", segment: [30, 40] },
+      { category: "filler", actionType: "full", segment: [0, 100] },
+      { category: "sponsor", actionType: "skip", segment: [50, 60] },
+    ];
+    const ads = parseSponsorBlockResponse(payload);
+    assert.equal(ads.length, 1);
+    assert.equal(ads[0].startMs, 50_000);
+  });
+
+  it("keeps mute action type alongside skip", () => {
+    const payload = [
+      { category: "sponsor", actionType: "mute", segment: [10, 15] },
+    ];
+    const ads = parseSponsorBlockResponse(payload);
+    assert.equal(ads.length, 1);
+    assert.equal(ads[0].title, "[SponsorBlock]: sponsor");
+  });
+
+  it("rejects malformed segments defensively", () => {
+    const payload = [
+      { category: "sponsor", actionType: "skip", segment: [10] }, // wrong length
+      { category: "sponsor", actionType: "skip", segment: ["a", "b"] }, // wrong types
+      { category: "sponsor", actionType: "skip", segment: [50, 30] }, // end <= start
+      { category: "sponsor", actionType: "skip" }, // segment missing
+      { category: "sponsor", actionType: "skip", segment: [10, 20] }, // good
+      null,
+      "string entry",
+    ];
+    const ads = parseSponsorBlockResponse(payload);
+    assert.equal(ads.length, 1);
+    assert.equal(ads[0].startMs, 10_000);
+    assert.equal(ads[0].endMs, 20_000);
+  });
+
+  it("falls back to a generic title when category is missing", () => {
+    const payload = [{ actionType: "skip", segment: [10, 20] }];
+    const ads = parseSponsorBlockResponse(payload);
+    assert.equal(ads.length, 1);
+    assert.equal(ads[0].title, "[SponsorBlock]: segment");
   });
 });

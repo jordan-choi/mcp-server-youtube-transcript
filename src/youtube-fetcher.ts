@@ -68,19 +68,24 @@ const AD_MARKERS: ReadonlyArray<string> = [
   "(promo)", "(promotion)", "(anzeige)", "(reklame)",
   "[werbung]", "[ad]", "[ads]", "[sponsor]", "[sponsored]",
   "[promo]", "[promotion]", "[anzeige]", "[reklame]",
-  // SponsorBlock-injected chapters from `yt-dlp --sponsorblock-mark`. The
-  // injected titles look like `[SponsorBlock]: Sponsor`,
-  // `[SponsorBlock]: Unpaid/Self Promotion`, etc. — the `[SponsorBlock]`
-  // prefix is the consistent token, lowercased here for the includes() check.
-  "[sponsorblock]",
 ];
 
-// SponsorBlock categories we ask yt-dlp to mark when strip_ads is true.
-// `sponsor` covers paid promotions; `selfpromo` covers the creator's own
-// merch / Patreon / channel pitches. We deliberately leave out `intro`,
-// `outro`, `interaction`, `preview`, `music_offtopic`, and `filler` — those
-// are useful context, not advertising.
-const SPONSORBLOCK_CATEGORIES = "sponsor,selfpromo";
+// SponsorBlock — community-labeled sponsor segment database.
+// We call the public API directly because yt-dlp's --sponsorblock-mark flag
+// only injects chapters when yt-dlp is post-processing a downloaded video.
+// With --skip-download (our case), that post-processing step never runs and
+// the SponsorBlock data is silently dropped.
+const SPONSORBLOCK_API_URL = "https://sponsor.ajay.app/api/skipSegments";
+// Categories we treat as ad-equivalent. `sponsor` covers paid promotions;
+// `selfpromo` covers the creator's own merch / Patreon / channel pitches.
+// Other categories (intro, outro, interaction, preview, music_offtopic,
+// filler) carry useful content and are deliberately excluded.
+const SPONSORBLOCK_CATEGORIES = ["sponsor", "selfpromo"] as const;
+// Action types we filter on. `skip` is a hard-skip ad; `mute` is a muted
+// segment (still an ad, just shorter / in-place). Other action types
+// (`poi`, `chapter`, `full`) are not ad-related and shouldn't be filtered.
+const SPONSORBLOCK_ACTION_TYPES = new Set(["skip", "mute"]);
+const SPONSORBLOCK_TIMEOUT_MS = 10_000;
 
 export interface YtDlpInfo {
   title?: string;
@@ -115,30 +120,15 @@ function describeYtDlpError(err: unknown): string {
 
 /**
  * Run `yt-dlp -J --skip-download URL` and parse the metadata JSON.
- *
- * When `useSponsorBlock` is true, also pass `--sponsorblock-mark <cats>` so
- * SponsorBlock-detected segments are injected into the JSON's `chapters`
- * array. The injected entries are titled `[SponsorBlock]: <Category>` and
- * are matched by the existing AD_MARKERS list, so callers don't need to
- * branch on the data source — sponsor-segment removal works uniformly
- * whether the chapters come from the creator or from SponsorBlock.
  */
-async function fetchVideoInfo(
-  url: string,
-  useSponsorBlock = false,
-): Promise<YtDlpInfo> {
-  const args = ["-J", "--skip-download"];
-  if (useSponsorBlock) {
-    args.push("--sponsorblock-mark", SPONSORBLOCK_CATEGORIES);
-  }
-  args.push(url);
-
+async function fetchVideoInfo(url: string): Promise<YtDlpInfo> {
   let stdout: string;
   try {
-    const result = await execFile("yt-dlp", args, {
-      timeout: YT_DLP_TIMEOUT_MS,
-      maxBuffer: YT_DLP_MAX_BUFFER,
-    });
+    const result = await execFile(
+      "yt-dlp",
+      ["-J", "--skip-download", url],
+      { timeout: YT_DLP_TIMEOUT_MS, maxBuffer: YT_DLP_MAX_BUFFER },
+    );
     stdout = result.stdout;
   } catch (err) {
     throw new Error(`yt-dlp metadata fetch failed: ${describeYtDlpError(err)}`);
@@ -177,6 +167,104 @@ export function extractCaptionTracks(info: YtDlpInfo): CaptionTrack[] {
   }
 
   return tracks;
+}
+
+/**
+ * Convert SponsorBlock's `/api/skipSegments` response into AdChapter[].
+ * Exported so the parsing can be unit-tested with hand-rolled fixtures.
+ *
+ * Filters defensively:
+ *   - Only segments with a [start, end] number tuple are kept.
+ *   - Only `skip` and `mute` action types — other types (`poi`, `chapter`,
+ *     `full`) are not ads and shouldn't be filtered out.
+ *
+ * Each surviving segment becomes an AdChapter titled
+ * `[SponsorBlock]: <category>` so the chapter list stays self-describing.
+ */
+export function parseSponsorBlockResponse(json: unknown): AdChapter[] {
+  if (!Array.isArray(json)) return [];
+
+  const out: AdChapter[] = [];
+  for (const raw of json) {
+    if (raw == null || typeof raw !== "object") continue;
+    const entry = raw as {
+      category?: unknown;
+      actionType?: unknown;
+      segment?: unknown;
+    };
+
+    const segment = entry.segment;
+    if (!Array.isArray(segment) || segment.length !== 2) continue;
+    const [startSec, endSec] = segment;
+    if (typeof startSec !== "number" || typeof endSec !== "number") continue;
+    if (!(endSec > startSec)) continue;
+
+    const actionType =
+      typeof entry.actionType === "string" ? entry.actionType : "skip";
+    if (!SPONSORBLOCK_ACTION_TYPES.has(actionType)) continue;
+
+    const category =
+      typeof entry.category === "string" && entry.category.length > 0
+        ? entry.category
+        : "segment";
+
+    out.push({
+      title: `[SponsorBlock]: ${category}`,
+      startMs: Math.round(startSec * 1000),
+      endMs: Math.round(endSec * 1000),
+    });
+  }
+  return out;
+}
+
+/**
+ * Hit SponsorBlock's `/api/skipSegments` for the given video and return its
+ * sponsor-categorised segments as AdChapter[]. Network failures, 404s, and
+ * malformed responses all degrade to an empty array — strip_ads is best
+ * effort, never fatal.
+ */
+async function fetchSponsorBlockSegments(
+  videoID: string,
+): Promise<AdChapter[]> {
+  const params = new URLSearchParams({
+    videoID,
+    categories: JSON.stringify(SPONSORBLOCK_CATEGORIES),
+  });
+  const url = `${SPONSORBLOCK_API_URL}?${params.toString()}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      signal: AbortSignal.timeout(SPONSORBLOCK_TIMEOUT_MS),
+      headers: { "User-Agent": "mcp-server-youtube-transcript" },
+    });
+  } catch (err) {
+    console.error(
+      `[youtube-fetcher] SponsorBlock fetch failed: ${(err as Error).message}`,
+    );
+    return [];
+  }
+
+  // 404 = no segments labeled for this video — common, not an error.
+  if (response.status === 404) return [];
+  if (!response.ok) {
+    console.error(
+      `[youtube-fetcher] SponsorBlock returned HTTP ${response.status}`,
+    );
+    return [];
+  }
+
+  let json: unknown;
+  try {
+    json = await response.json();
+  } catch (err) {
+    console.error(
+      `[youtube-fetcher] SponsorBlock returned non-JSON: ${(err as Error).message}`,
+    );
+    return [];
+  }
+
+  return parseSponsorBlockResponse(json);
 }
 
 /**
@@ -285,10 +373,20 @@ export async function getSubtitles(options: {
 
   const url = `https://www.youtube.com/watch?v=${videoID}`;
 
-  // Stage 1 — metadata, chapters, available subs.
-  const info = await fetchVideoInfo(url, useSponsorBlock);
+  // Stage 1 — metadata + (optionally) SponsorBlock, in parallel. The
+  // SponsorBlock fetch is independent of yt-dlp, so we don't pay a serial
+  // round-trip for it. If the user opted out (strip_ads=false), we don't
+  // hit SponsorBlock at all.
+  const [info, sponsorBlockChapters] = await Promise.all([
+    fetchVideoInfo(url),
+    useSponsorBlock
+      ? fetchSponsorBlockSegments(videoID)
+      : Promise.resolve<AdChapter[]>([]),
+  ]);
   const availableLanguages = extractCaptionTracks(info);
-  const adChapters = extractAdChapters(info);
+  // Union creator-marked chapters with SponsorBlock segments. Both sources
+  // can be sparse / wrong; using both maximises coverage.
+  const adChapters = [...extractAdChapters(info), ...sponsorBlockChapters];
   const metadata = extractMetadata(info);
 
   // Pick target language with fallback.
