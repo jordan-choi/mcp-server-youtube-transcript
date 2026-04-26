@@ -101,6 +101,115 @@ second cue
     assert.equal(result[1].text, "second cue");
   });
 
+  it("merges a rolling auto-caption pair into a single cue", () => {
+    // Cue 2 starts with all of cue 1's words plus new ones.
+    const vtt = `WEBVTT
+
+00:00:00.000 --> 00:00:01.000
+hello world
+
+00:00:01.000 --> 00:00:02.000
+hello world how are you
+`;
+    const result = parseVtt(vtt);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].text, "hello world how are you");
+    assert.equal(result[0].start, 0);
+    assert.equal(result[0].dur, 2);
+  });
+
+  it("accumulates three rolling cues into one", () => {
+    const vtt = `WEBVTT
+
+00:00:00.000 --> 00:00:01.000
+A B C
+
+00:00:01.000 --> 00:00:02.000
+B C D E
+
+00:00:02.000 --> 00:00:03.000
+D E F G
+`;
+    const result = parseVtt(vtt);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].text, "A B C D E F G");
+    assert.equal(result[0].start, 0);
+    assert.equal(result[0].dur, 3);
+  });
+
+  it("absorbs a cue that is fully contained as a suffix of the previous", () => {
+    // Common in rolling captions when the next batch of words hasn't
+    // arrived yet — yt-dlp emits a cue that's just a tail-restatement.
+    const vtt = `WEBVTT
+
+00:00:00.000 --> 00:00:02.000
+A B C D E
+
+00:00:02.000 --> 00:00:04.000
+C D E
+`;
+    const result = parseVtt(vtt);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].text, "A B C D E");
+    assert.equal(result[0].start, 0);
+    assert.equal(result[0].dur, 4);
+  });
+
+  it("does not merge when overlap is just one word (below threshold)", () => {
+    // A single shared word is too weak a signal — could just be coincidence
+    // ("...the cat" / "the dog ran"). Keep both cues distinct.
+    const vtt = `WEBVTT
+
+00:00:00.000 --> 00:00:01.000
+the cat
+
+00:00:01.000 --> 00:00:02.000
+the dog ran
+`;
+    const result = parseVtt(vtt);
+    assert.equal(result.length, 2);
+    assert.deepEqual(result.map((l) => l.text), ["the cat", "the dog ran"]);
+  });
+
+  it("merges a realistic YouTube rolling fixture (the field bug)", () => {
+    // Reproduces the pattern reported against KFisvc-AMII: each cue is the
+    // tail of the previous plus a few new words, with cues repeating
+    // multiple times before the next phrase comes in.
+    const vtt = `WEBVTT
+
+00:00:01.000 --> 00:00:01.999
+Have you noticed Claude's performance
+
+00:00:01.000 --> 00:00:02.999
+Have you noticed Claude's performance varying by day? Claude Opus 4.7 is a
+
+00:00:03.000 --> 00:00:03.999
+varying by day? Claude Opus 4.7 is a
+
+00:00:03.000 --> 00:00:04.999
+varying by day? Claude Opus 4.7 is a serious regression, not an upgrade.
+
+00:00:05.000 --> 00:00:05.999
+serious regression, not an upgrade.
+
+00:00:05.000 --> 00:00:06.999
+serious regression, not an upgrade. AMD's AI director slams Claude for
+
+00:00:07.000 --> 00:00:07.999
+AMD's AI director slams Claude for
+
+00:00:08.000 --> 00:00:09.000
+AMD's AI director slams Claude for becoming dumber and lazier since last
+`;
+    const result = parseVtt(vtt);
+    assert.equal(result.length, 1);
+    assert.equal(
+      result[0].text,
+      "Have you noticed Claude's performance varying by day? Claude Opus 4.7 is a serious regression, not an upgrade. AMD's AI director slams Claude for becoming dumber and lazier since last",
+    );
+    assert.equal(result[0].start, 1);
+  });
+
   it("collapses adjacent cues with identical text (rolling auto-captions)", () => {
     // yt-dlp's auto-caption output has overlapping rolling cues that
     // resolve to the same cleaned text after stripping inline tags.
