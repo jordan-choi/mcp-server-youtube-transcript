@@ -14,6 +14,7 @@ import {
   CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import { getSubtitles, AdChapter, CaptionTrack } from './youtube-fetcher.js';
+import { formatTranscript } from './format-transcript.js';
 
 const execFile = promisify(execFileCallback);
 
@@ -63,12 +64,6 @@ const TOOLS: Tool[] = [
     },
   },
 ];
-
-interface TranscriptLine {
-  text: string;
-  start: number;
-  dur: number;
-}
 
 class YouTubeTranscriptExtractor {
   /**
@@ -170,7 +165,7 @@ class YouTubeTranscriptExtractor {
       }
 
       return {
-        text: this.formatTranscript(lines, includeTimestamps),
+        text: formatTranscript(lines, includeTimestamps),
         actualLang: result.actualLang,
         availableLanguages: result.availableLanguages.map((t: CaptionTrack) => t.languageCode),
         adsStripped,
@@ -186,31 +181,6 @@ class YouTubeTranscriptExtractor {
     }
   }
 
-  /**
-   * Formats transcript lines into readable text
-   */
-  private formatTranscript(transcript: TranscriptLine[], includeTimestamps: boolean): string {
-    if (includeTimestamps) {
-      return transcript
-        .map(line => {
-          const totalSeconds = Math.floor(line.start);
-          const hours = Math.floor(totalSeconds / 3600);
-          const mins = Math.floor((totalSeconds % 3600) / 60);
-          const secs = totalSeconds % 60;
-          // Use h:mm:ss for videos > 1 hour, mm:ss otherwise
-          const timestamp = hours > 0
-            ? `[${hours}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`
-            : `[${mins}:${secs.toString().padStart(2, '0')}]`;
-          return `${timestamp} ${line.text.trim()}`;
-        })
-        .filter(text => text.length > 0)
-        .join('\n');
-    }
-    return transcript
-      .map(line => line.text.trim())
-      .filter(text => text.length > 0)
-      .join(' ');
-  }
 }
 
 class TranscriptServer {
