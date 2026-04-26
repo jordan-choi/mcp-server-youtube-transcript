@@ -111,24 +111,31 @@ export function parseVtt(vtt: string): TranscriptLine[] {
   // End-of-file flush in case the last cue isn't followed by a blank line.
   flush();
 
-  // Merge rolling auto-caption cues. YouTube's auto-captions are streamed as
-  // overlapping rolling cues — each cue contains the tail of the previous
-  // one plus a few new words, so naive concatenation produces massive
-  // duplication. We collapse these by detecting word-level overlap between
-  // adjacent cues.
-  const merged: TranscriptLine[] = [];
+  // Reduce rolling auto-caption cues into a non-overlapping sequence.
+  // YouTube's auto-captions are streamed as overlapping rolling cues — each
+  // cue contains the tail of the previous one plus a few new words. Naive
+  // concatenation produces 3-4x duplication; collapsing into one giant cue
+  // (the previous approach) loses the per-segment timestamps the formatter
+  // and the ad-strip filter both rely on.
+  //
+  // We keep one cue per *new* chunk of text. For each incoming cue we
+  // compute how many trailing words of what we've already kept reappear at
+  // the start of the cue; everything past that prefix is genuinely new and
+  // becomes its own cue with the incoming cue's start time. Cues that
+  // introduce no new words (fully contained as a suffix of our running
+  // text) are absorbed by extending the previous cue's duration.
+  const kept: TranscriptLine[] = [];
+  const cumulativeWords: string[] = [];
+
   for (const cue of cues) {
-    const last = merged[merged.length - 1];
+    const cueWords = cue.text.split(/\s+/).filter(Boolean);
+    if (cueWords.length === 0) continue;
 
-    if (!last) {
-      merged.push(cue);
-      continue;
-    }
+    const last = kept[kept.length - 1];
 
-    if (last.text === cue.text) {
-      // Exact duplicate — keep the earlier cue and extend its duration to
-      // cover the later one.
-      merged[merged.length - 1] = {
+    if (last && last.text === cue.text) {
+      // Exact duplicate — keep the earlier cue, extend its duration.
+      kept[kept.length - 1] = {
         text: last.text,
         start: last.start,
         dur: Math.max(last.dur, cue.start + cue.dur - last.start),
@@ -136,55 +143,72 @@ export function parseVtt(vtt: string): TranscriptLine[] {
       continue;
     }
 
-    const rolled = mergeRolling(last, cue);
-    if (rolled) {
-      merged[merged.length - 1] = rolled;
-      continue;
-    }
+    const overlap = wordSuffixPrefixOverlap(cumulativeWords, cueWords);
 
-    merged.push(cue);
+    if (overlap >= MIN_ROLLING_OVERLAP_WORDS) {
+      const newWords = cueWords.slice(overlap);
+      if (newWords.length === 0) {
+        // Fully contained — extend the last kept cue's duration.
+        if (last) {
+          kept[kept.length - 1] = {
+            text: last.text,
+            start: last.start,
+            dur: Math.max(last.dur, cue.start + cue.dur - last.start),
+          };
+        }
+        continue;
+      }
+      kept.push({
+        text: newWords.join(" "),
+        start: cue.start,
+        dur: cue.dur,
+      });
+      for (const w of newWords) cumulativeWords.push(w);
+    } else {
+      kept.push(cue);
+      for (const w of cueWords) cumulativeWords.push(w);
+    }
   }
 
-  return merged;
+  return kept;
 }
 
 /**
- * Minimum word overlap to call two adjacent cues a rolling pair. Below this
- * threshold the overlap is more likely a coincidence than a rolling caption,
- * and merging would risk eating real content.
+ * Minimum word overlap to treat as a rolling caption. A single shared word
+ * is too weak a signal — could be a coincidence — and trimming it would risk
+ * eating real content from the start of the new cue.
  */
 const MIN_ROLLING_OVERLAP_WORDS = 2;
 
 /**
- * If `current.text` starts with a multi-word suffix of `prev.text` (≥
- * MIN_ROLLING_OVERLAP_WORDS), treat them as a rolling auto-caption pair and
- * return a single merged cue. The merged cue keeps prev's start time and
- * extends through current's end time; its text is prev's text followed by
- * only the new words from current.
- *
- * Returns null if no qualifying overlap is found, in which case the caller
- * should keep both cues separate.
+ * How far back into the running cumulative text we'll look for an overlap.
+ * Real rolling-caption windows are short (a sentence or so); bounding the
+ * search keeps this O(N) overall instead of quadratic in transcript length.
  */
-function mergeRolling(
-  prev: TranscriptLine,
-  current: TranscriptLine,
-): TranscriptLine | null {
-  const prevWords = prev.text.split(/\s+/).filter(Boolean);
-  const currWords = current.text.split(/\s+/).filter(Boolean);
-  const maxOverlap = Math.min(prevWords.length, currWords.length);
+const ROLLING_LOOKBACK_WORDS = 50;
 
-  for (let n = maxOverlap; n >= MIN_ROLLING_OVERLAP_WORDS; n--) {
-    const prevSuffix = prevWords.slice(prevWords.length - n).join(" ");
-    const currPrefix = currWords.slice(0, n).join(" ");
-    if (prevSuffix === currPrefix) {
-      const newWords = prevWords.concat(currWords.slice(n));
-      return {
-        text: newWords.join(" "),
-        start: prev.start,
-        dur: Math.max(prev.dur, current.start + current.dur - prev.start),
-      };
+/**
+ * Returns how many trailing words of `cumulative` appear verbatim at the
+ * head of `current`. Returns 0 if there is no such match.
+ */
+function wordSuffixPrefixOverlap(
+  cumulative: string[],
+  current: string[],
+): number {
+  if (cumulative.length === 0 || current.length === 0) return 0;
+
+  const lookback = Math.min(cumulative.length, ROLLING_LOOKBACK_WORDS);
+  const max = Math.min(lookback, current.length);
+
+  for (let n = max; n >= 1; n--) {
+    let match = true;
+    for (let i = 0; i < n; i++) {
+      if (cumulative[cumulative.length - n + i] !== current[i]) {
+        match = false;
+        break;
+      }
     }
+    if (match) return n;
   }
-
-  return null;
+  return 0;
 }

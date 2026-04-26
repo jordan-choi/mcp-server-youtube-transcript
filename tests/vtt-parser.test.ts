@@ -101,8 +101,10 @@ second cue
     assert.equal(result[1].text, "second cue");
   });
 
-  it("merges a rolling auto-caption pair into a single cue", () => {
-    // Cue 2 starts with all of cue 1's words plus new ones.
+  it("strips rolling overlap, keeping each cue's new portion separately", () => {
+    // Cue 2 starts with all of cue 1's words plus new ones. We keep cue 1
+    // intact and emit cue 2's *new* portion as its own line, so the
+    // include_timestamps formatter still has two timestamp anchors.
     const vtt = `WEBVTT
 
 00:00:00.000 --> 00:00:01.000
@@ -112,13 +114,14 @@ hello world
 hello world how are you
 `;
     const result = parseVtt(vtt);
-    assert.equal(result.length, 1);
-    assert.equal(result[0].text, "hello world how are you");
+    assert.equal(result.length, 2);
+    assert.equal(result[0].text, "hello world");
     assert.equal(result[0].start, 0);
-    assert.equal(result[0].dur, 2);
+    assert.equal(result[1].text, "how are you");
+    assert.equal(result[1].start, 1);
   });
 
-  it("accumulates three rolling cues into one", () => {
+  it("preserves three rolling cues as three separate non-overlapping lines", () => {
     const vtt = `WEBVTT
 
 00:00:00.000 --> 00:00:01.000
@@ -131,15 +134,16 @@ B C D E
 D E F G
 `;
     const result = parseVtt(vtt);
-    assert.equal(result.length, 1);
-    assert.equal(result[0].text, "A B C D E F G");
-    assert.equal(result[0].start, 0);
-    assert.equal(result[0].dur, 3);
+    assert.equal(result.length, 3);
+    assert.deepEqual(result.map((l) => l.text), ["A B C", "D E", "F G"]);
+    assert.deepEqual(result.map((l) => l.start), [0, 1, 2]);
   });
 
-  it("absorbs a cue that is fully contained as a suffix of the previous", () => {
+  it("absorbs a cue that is fully contained as a suffix of the running text", () => {
     // Common in rolling captions when the next batch of words hasn't
     // arrived yet — yt-dlp emits a cue that's just a tail-restatement.
+    // The cue contributes no new words, so we keep one line and extend its
+    // duration.
     const vtt = `WEBVTT
 
 00:00:00.000 --> 00:00:02.000
@@ -155,9 +159,9 @@ C D E
     assert.equal(result[0].dur, 4);
   });
 
-  it("does not merge when overlap is just one word (below threshold)", () => {
+  it("does not strip overlap when overlap is just one word (below threshold)", () => {
     // A single shared word is too weak a signal — could just be coincidence
-    // ("...the cat" / "the dog ran"). Keep both cues distinct.
+    // ("...the cat" / "the dog ran"). Keep both cues with full text.
     const vtt = `WEBVTT
 
 00:00:00.000 --> 00:00:01.000
@@ -171,10 +175,11 @@ the dog ran
     assert.deepEqual(result.map((l) => l.text), ["the cat", "the dog ran"]);
   });
 
-  it("merges a realistic YouTube rolling fixture (the field bug)", () => {
+  it("yields per-segment timestamped cues for a realistic YouTube rolling fixture", () => {
     // Reproduces the pattern reported against KFisvc-AMII: each cue is the
-    // tail of the previous plus a few new words, with cues repeating
-    // multiple times before the next phrase comes in.
+    // tail of the previous plus a few new words. The fix should produce a
+    // line per *new* phrase, each with its own start time, so include_
+    // timestamps and ad-strip both keep working.
     const vtt = `WEBVTT
 
 00:00:01.000 --> 00:00:01.999
@@ -202,12 +207,16 @@ AMD's AI director slams Claude for
 AMD's AI director slams Claude for becoming dumber and lazier since last
 `;
     const result = parseVtt(vtt);
-    assert.equal(result.length, 1);
-    assert.equal(
-      result[0].text,
-      "Have you noticed Claude's performance varying by day? Claude Opus 4.7 is a serious regression, not an upgrade. AMD's AI director slams Claude for becoming dumber and lazier since last",
+    assert.deepEqual(
+      result.map((l) => ({ text: l.text, start: l.start })),
+      [
+        { text: "Have you noticed Claude's performance", start: 1 },
+        { text: "varying by day? Claude Opus 4.7 is a", start: 1 },
+        { text: "serious regression, not an upgrade.", start: 3 },
+        { text: "AMD's AI director slams Claude for", start: 5 },
+        { text: "becoming dumber and lazier since last", start: 8 },
+      ],
     );
-    assert.equal(result[0].start, 1);
   });
 
   it("collapses adjacent cues with identical text (rolling auto-captions)", () => {
