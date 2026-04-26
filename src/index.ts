@@ -160,7 +160,7 @@ class YouTubeTranscriptExtractor {
         });
         adsStripped = originalCount - lines.length;
         if (adsStripped > 0) {
-          console.log(`[youtube-transcript] Filtered ${adsStripped} lines from ${result.adChapters.length} ad chapter(s): ${result.adChapters.map((a: AdChapter) => a.title).join(', ')}`);
+          console.error(`[youtube-transcript] Filtered ${adsStripped} lines from ${result.adChapters.length} ad chapter(s): ${result.adChapters.map((a: AdChapter) => a.title).join(', ')}`);
         }
       }
 
@@ -277,10 +277,10 @@ class TranscriptServer {
 
         try {
           const videoId = this.extractor.extractYoutubeId(input);
-          console.log(`Processing transcript for video: ${videoId}, lang: ${lang}, timestamps: ${include_timestamps}, strip_ads: ${strip_ads}`);
+          console.error(`Processing transcript for video: ${videoId}, lang: ${lang}, timestamps: ${include_timestamps}, strip_ads: ${strip_ads}`);
 
           const result = await this.extractor.getTranscript(videoId, lang, include_timestamps, strip_ads);
-          console.log(`Successfully extracted transcript (${result.text.length} chars, lang: ${result.actualLang}, ads stripped: ${result.adsStripped})`);
+          console.error(`Successfully extracted transcript (${result.text.length} chars, lang: ${result.actualLang}, ads stripped: ${result.adsStripped})`);
 
           // Build transcript with notes
           let transcript = result.text;
