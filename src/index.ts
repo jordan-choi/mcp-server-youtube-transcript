@@ -15,6 +15,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { getSubtitles, AdChapter, CaptionTrack } from './youtube-fetcher.js';
 import { formatTranscript } from './format-transcript.js';
+import { validateLanguageCode } from './lang-code.js';
 
 const execFile = promisify(execFileCallback);
 
@@ -32,7 +33,7 @@ const TOOLS: Tool[] = [
         },
         lang: {
           type: "string",
-          description: "Language code for transcript (e.g., 'ko', 'en'). Will fall back to available language if not found.",
+          description: "ISO 639-1 (2-letter) language code, e.g. 'en' for English or 'ko' for Korean. Optionally with a region suffix like 'en-US' or 'pt-BR'. 3-letter ISO 639-2 codes ('eng', 'kor', etc.) are NOT accepted — use the 2-letter form. Falls back to an available language if the requested one isn't published.",
           default: "en"
         },
         include_timestamps: {
@@ -246,11 +247,9 @@ class TranscriptServer {
           );
         }
 
-        if (lang && typeof lang !== 'string') {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'Language code must be a string'
-          );
+        const langError = validateLanguageCode(lang);
+        if (langError) {
+          throw new McpError(ErrorCode.InvalidParams, langError);
         }
 
         try {
