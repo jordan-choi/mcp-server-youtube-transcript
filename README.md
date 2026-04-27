@@ -1,178 +1,154 @@
-[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/kimtaeyoon83-mcp-server-youtube-transcript-badge.png)](https://mseep.ai/app/kimtaeyoon83-mcp-server-youtube-transcript)
+# YouTube Transcript MCP Server
 
-# YouTube Transcript Server
-[![Trust Score](https://archestra.ai/mcp-catalog/api/badge/quality/kimtaeyoon83/mcp-server-youtube-transcript)](https://archestra.ai/mcp-catalog/kimtaeyoon83__mcp-server-youtube-transcript)
+An MCP server that returns transcripts for YouTube videos. Forked from [`kimtaeyoon83/mcp-server-youtube-transcript`](https://github.com/kimtaeyoon83/mcp-server-youtube-transcript) with these substantive changes:
 
-[![smithery badge](https://smithery.ai/badge/@kimtaeyoon83/mcp-server-youtube-transcript)](https://smithery.ai/server/@kimtaeyoon83/mcp-server-youtube-transcript)
+- **Backend swapped** from a hand-rolled HTTPS scraper to [`yt-dlp`](https://github.com/yt-dlp/yt-dlp). YouTube changes don't break this server unless they also break yt-dlp, which the community generally fixes within days.
+- **Sponsor segment removal via [SponsorBlock](https://sponsor.ajay.app/)** when `strip_ads: true`, even on videos with no creator-added chapter markers.
+- **Rolling auto-caption duplication is collapsed.** Transcripts no longer include "Have you noticed Claude's performance Have you noticed Claude's performance varying by day…" repetition.
+- **Per-sentence timestamps** when `include_timestamps: true` instead of one anchor per ~1-second cue.
+- **`lang` argument is validated** with an actionable hint — passing `kor` instead of `ko` returns *"Did you mean 'ko'?"* up front instead of an opaque yt-dlp error mid-call.
 
-A Model Context Protocol server that enables retrieval of transcripts from YouTube videos. This server provides direct access to video captions and subtitles through a simple interface.
+## Prerequisites
 
-<a href="https://glama.ai/mcp/servers/z429kk3te7"><img width="380" height="200" src="https://glama.ai/mcp/servers/z429kk3te7/badge" alt="mcp-server-youtube-transcript MCP server" /></a>
+`yt-dlp` must be installed and on the user's `PATH`:
 
-### Installing via Smithery
+| OS | Command |
+| --- | --- |
+| macOS | `brew install yt-dlp` |
+| Windows | `winget install yt-dlp.yt-dlp` |
+| Linux | `pipx install yt-dlp` (or your distro package) |
 
-To install YouTube Transcript Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@kimtaeyoon83/mcp-server-youtube-transcript):
+The server checks for `yt-dlp` at startup. If missing, it writes the install instructions above to stderr and exits non-zero — the failure shows up in your MCP host's log instead of producing opaque per-call errors.
 
-```bash
-npx -y @smithery/cli install @kimtaeyoon83/mcp-server-youtube-transcript --client claude
-```
+Node.js 18 or higher is also required for runtime.
 
-## Components
+## Tool
 
-### Tools
+### `get_transcript`
 
-- **get_transcript**
-  - Extract transcripts from YouTube videos
-  - Inputs:
-    - `url` (string, required): YouTube video URL, Shorts URL, or video ID
-    - `lang` (string, optional, default: "en"): Language code for transcript (e.g., 'ko', 'en'). Automatically falls back to available languages if requested language is not found.
-    - `include_timestamps` (boolean, optional, default: false): Include timestamps in output (e.g., '[0:05] text')
-    - `strip_ads` (boolean, optional, default: true): Filter out sponsorships, ads, and promotional content from transcript based on chapter markers
+Returns the transcript text for a YouTube video, with optional sponsor filtering and per-sentence timestamps.
 
-## Key Features
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `url` | string | — | YouTube video URL, Shorts URL, or 11-character video ID. |
+| `lang` | string | `"en"` | ISO 639-1 (2-letter) language code, optionally with a region suffix (`en-US`, `pt-BR`, `zh-Hant`, `es-419`). 3-letter ISO 639-2 codes (`kor`, `eng`, …) are not accepted — use the 2-letter form. Falls back to an available language if the requested one isn't published. |
+| `include_timestamps` | boolean | `false` | Prefix each sentence with `[m:ss]` (or `[h:mm:ss]` for videos longer than an hour). |
+| `strip_ads` | boolean | `true` | Filter out sponsor segments. Uses both creator-marked chapters and the SponsorBlock community database. See "Privacy" below. |
 
-- Support for multiple video URL formats (including YouTube Shorts)
-- Language-specific transcript retrieval with automatic fallback
-- Optional timestamps for referencing specific moments
-- Built-in ad/sponsorship filtering (enabled by default)
-- Zero external dependencies for transcript fetching
-- Detailed metadata in responses
+The response includes the cleaned transcript text plus `structuredContent` with the video's title, author, subscriber count, view count, and publish date.
 
 ## Configuration
 
-To use with Claude Desktop, add this server configuration:
+Add this entry to your MCP host configuration (e.g. `~/Library/Application Support/Claude/claude_desktop_config.json` for Claude Desktop):
 
 ```json
 {
   "mcpServers": {
     "youtube-transcript": {
       "command": "npx",
-      "args": ["-y", "@kimtaeyoon83/mcp-server-youtube-transcript"]
+      "args": ["-y", "@jordan-choi/mcp-server-youtube-transcript"]
     }
   }
 }
 ```
 
-## Install via tool
+To install from source instead of npm, see "Development" below.
 
-[mcp-get](https://github.com/michaellatman/mcp-get) A command-line tool for installing and managing Model Context Protocol (MCP) servers.
+## Privacy
 
-```shell 
-npx @michaellatman/mcp-get@latest install @kimtaeyoon83/mcp-server-youtube-transcript
+When `strip_ads: true` (the default), the server queries [SponsorBlock](https://sponsor.ajay.app) at `https://sponsor.ajay.app/api/skipSegments` to look up sponsor segments. Each call sends the YouTube video ID to that server. Pass `strip_ads: false` to opt out — no third-party request is made in that case.
+
+Subtitle and metadata fetching itself goes only to `youtube.com` via `yt-dlp`. No analytics, telemetry, or other third parties are involved.
+
+## Usage examples
+
+```typescript
+// By URL
+await server.callTool("get_transcript", {
+  url: "https://www.youtube.com/watch?v=VIDEO_ID",
+  lang: "en",
+});
+
+// By video ID
+await server.callTool("get_transcript", {
+  url: "VIDEO_ID",
+  lang: "ko",
+});
+
+// Shorts
+await server.callTool("get_transcript", {
+  url: "https://www.youtube.com/shorts/VIDEO_ID",
+});
+
+// With per-sentence timestamps
+await server.callTool("get_transcript", {
+  url: "VIDEO_ID",
+  include_timestamps: true,
+});
+
+// Without sponsor filtering — also opts out of the SponsorBlock query
+await server.callTool("get_transcript", {
+  url: "VIDEO_ID",
+  strip_ads: false,
+});
 ```
 
-## Awesome-mcp-servers 
-[awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) A curated list of awesome Model Context Protocol (MCP) servers.
+## Error handling
+
+| Condition | Result |
+| --- | --- |
+| Invalid URL or video ID | `InvalidParams` |
+| Invalid `lang` (e.g. `"kor"` instead of `"ko"`) | `InvalidParams` with a "Did you mean 'X'?" hint when applicable |
+| `yt-dlp` not installed at startup | Process exits 1 with install instructions on stderr |
+| `yt-dlp` non-zero exit during a call | `InternalError` with yt-dlp's actual `ERROR:` line (not the ffmpeg warning) |
+| Video has no captions | `InternalError` — *"No transcript available for this video. The video may not have captions enabled."* |
+| Requested language unavailable, fallback succeeds | No error; response is prefixed with `[Note: Requested language 'X' not available. Using 'Y'…]` |
+| Sponsor segments stripped | Response is prefixed with `[Note: N sponsored segment lines filtered out…]` |
 
 ## Development
 
-### Prerequisites
-
-- Node.js 18 or higher
-- npm or yarn
-
-### Setup
-
-Install dependencies:
 ```bash
 npm install
-```
-
-Build the server:
-```bash
-npm run build
+npm run build     # tsc → dist/
+npm test          # node:test via tsx
 ```
 
 For development with auto-rebuild:
+
 ```bash
 npm run watch
 ```
 
-### Testing
+The server uses stdio transport. To debug interactively without restarting your MCP host every time, use the MCP Inspector:
 
 ```bash
-npm test
+npx @modelcontextprotocol/inspector node dist/index.js
 ```
 
-### Debugging
+## Build from source (alternative to npm)
 
-Since MCP servers communicate over stdio, debugging can be challenging. We recommend using the MCP Inspector for development:
+If you'd rather not pull from npm:
 
 ```bash
-npm run inspector
+git clone https://github.com/jordan-choi/mcp-server-youtube-transcript
+cd mcp-server-youtube-transcript
+npm install
+npm run build
 ```
 
+Then point your MCP host at the built file:
 
-
-## Running evals
-
-The evals package loads an mcp client that then runs the index.ts file, so there is no need to rebuild between tests. You can load environment variables by prefixing the npx command. Full documentation can be found [here](https://www.mcpevals.io/docs).
-
-```bash
-OPENAI_API_KEY=your-key  npx mcp-eval src/evals/evals.ts src/index.ts
+```json
+{
+  "mcpServers": {
+    "youtube-transcript": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-server-youtube-transcript/dist/index.js"]
+    }
+  }
+}
 ```
-## Error Handling
-
-The server implements robust error handling for common scenarios:
-- Invalid video URLs or IDs
-- Unavailable transcripts
-- Language availability issues
-- Network errors
-
-## Usage Examples
-
-1. Get transcript by video URL:
-```typescript
-await server.callTool("get_transcript", {
-  url: "https://www.youtube.com/watch?v=VIDEO_ID",
-  lang: "en"
-});
-```
-
-2. Get transcript by video ID:
-```typescript
-await server.callTool("get_transcript", {
-  url: "VIDEO_ID",
-  lang: "ko"
-});
-```
-
-3. Get transcript from YouTube Shorts:
-```typescript
-await server.callTool("get_transcript", {
-  url: "https://www.youtube.com/shorts/VIDEO_ID"
-});
-```
-
-4. Get transcript with timestamps:
-```typescript
-await server.callTool("get_transcript", {
-  url: "VIDEO_ID",
-  include_timestamps: true
-});
-```
-
-5. Get raw transcript without ad filtering:
-```typescript
-await server.callTool("get_transcript", {
-  url: "VIDEO_ID",
-  strip_ads: false
-});
-```
-
-6. How to Extract YouTube Subtitles in Claude Desktop App
-```
-chat: https://youtu.be/ODaHJzOyVCQ?si=aXkJgso96Deri0aB Extract subtitles
-```
-
-## Security Considerations
-
-The server:
-- Validates all input parameters
-- Handles YouTube API errors gracefully
-- Implements timeouts for transcript retrieval
-- Provides detailed error messages for troubleshooting
 
 ## License
 
-This MCP server is licensed under the MIT License. See the LICENSE file for details.
+MIT — see [LICENSE](./LICENSE). Original copyright preserved per MIT terms; modifications copyright (c) 2026 Jordan Choi.
