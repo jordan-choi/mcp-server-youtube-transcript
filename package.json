@@ -1,11 +1,17 @@
 {
-  "name": "@kimtaeyoon83/mcp-server-youtube-transcript",
-  "version": "0.1.1",
-  "description": "This is an MCP server that allows you to directly download transcripts of YouTube videos.",
+  "name": "@jordanchoi/mcp-server-youtube-transcript",
+  "version": "0.2.0",
+  "description": "MCP server that returns YouTube video transcripts via yt-dlp, with SponsorBlock-based ad filtering and per-sentence timestamps. Forked from @kimtaeyoon83/mcp-server-youtube-transcript.",
   "license": "MIT",
-  "author": "Freddie",
-  "homepage": "https://github.com/kimtaeyoon83/mcp-server-youtube-transcript",
-  "bugs": "https://github.com/kimtaeyoon83/mcp-server-youtube-transcript/issues",
+  "author": "Jordan Choi",
+  "homepage": "https://github.com/jordan-choi/mcp-server-youtube-transcript#readme",
+  "bugs": {
+    "url": "https://github.com/jordan-choi/mcp-server-youtube-transcript/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jordan-choi/mcp-server-youtube-transcript.git"
+  },
   "access": "public",
   "type": "module",
   "main": "dist/index.js",
@@ -19,7 +25,8 @@
   "scripts": {
     "build": "tsc && shx chmod +x dist/*.js",
     "prepare": "npm run build",
-    "watch": "tsc --watch"
+    "watch": "tsc --watch",
+    "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.9.0",
@@ -28,6 +35,7 @@
   "devDependencies": {
     "@types/node": "^20.11.24",
     "shx": "^0.3.4",
+    "tsx": "^4.21.0",
     "typescript": "^5.6.2"
   }
 }

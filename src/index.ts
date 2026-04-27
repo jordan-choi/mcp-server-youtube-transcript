@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -11,6 +14,10 @@ import {
   CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import { getSubtitles, AdChapter, CaptionTrack } from './youtube-fetcher.js';
+import { formatTranscript } from './format-transcript.js';
+import { validateLanguageCode } from './lang-code.js';
+
+const execFile = promisify(execFileCallback);
 
 // Define tool configurations
 const TOOLS: Tool[] = [
@@ -26,7 +33,7 @@ const TOOLS: Tool[] = [
         },
         lang: {
           type: "string",
-          description: "Language code for transcript (e.g., 'ko', 'en'). Will fall back to available language if not found.",
+          description: "ISO 639-1 (2-letter) language code, e.g. 'en' for English or 'ko' for Korean. Optionally with a region suffix like 'en-US' or 'pt-BR'. 3-letter ISO 639-2 codes ('eng', 'kor', etc.) are NOT accepted — use the 2-letter form. Falls back to an available language if the requested one isn't published.",
           default: "en"
         },
         include_timestamps: {
@@ -58,12 +65,6 @@ const TOOLS: Tool[] = [
     },
   },
 ];
-
-interface TranscriptLine {
-  text: string;
-  start: number;
-  dur: number;
-}
 
 class YouTubeTranscriptExtractor {
   /**
@@ -143,6 +144,9 @@ class YouTubeTranscriptExtractor {
         videoID: videoId,
         lang: lang,
         enableFallback: true,
+        // Only opt in to SponsorBlock when the user wants ad-stripping —
+        // otherwise we'd hit a third-party server for nothing.
+        useSponsorBlock: stripAds,
       });
 
       let lines = result.lines;
@@ -160,12 +164,12 @@ class YouTubeTranscriptExtractor {
         });
         adsStripped = originalCount - lines.length;
         if (adsStripped > 0) {
-          console.log(`[youtube-transcript] Filtered ${adsStripped} lines from ${result.adChapters.length} ad chapter(s): ${result.adChapters.map((a: AdChapter) => a.title).join(', ')}`);
+          console.error(`[youtube-transcript] Filtered ${adsStripped} lines from ${result.adChapters.length} ad chapter(s): ${result.adChapters.map((a: AdChapter) => a.title).join(', ')}`);
         }
       }
 
       return {
-        text: this.formatTranscript(lines, includeTimestamps),
+        text: formatTranscript(lines, includeTimestamps),
         actualLang: result.actualLang,
         availableLanguages: result.availableLanguages.map((t: CaptionTrack) => t.languageCode),
         adsStripped,
@@ -181,31 +185,6 @@ class YouTubeTranscriptExtractor {
     }
   }
 
-  /**
-   * Formats transcript lines into readable text
-   */
-  private formatTranscript(transcript: TranscriptLine[], includeTimestamps: boolean): string {
-    if (includeTimestamps) {
-      return transcript
-        .map(line => {
-          const totalSeconds = Math.floor(line.start);
-          const hours = Math.floor(totalSeconds / 3600);
-          const mins = Math.floor((totalSeconds % 3600) / 60);
-          const secs = totalSeconds % 60;
-          // Use h:mm:ss for videos > 1 hour, mm:ss otherwise
-          const timestamp = hours > 0
-            ? `[${hours}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`
-            : `[${mins}:${secs.toString().padStart(2, '0')}]`;
-          return `${timestamp} ${line.text.trim()}`;
-        })
-        .filter(text => text.length > 0)
-        .join('\n');
-    }
-    return transcript
-      .map(line => line.text.trim())
-      .filter(text => text.length > 0)
-      .join(' ');
-  }
 }
 
 class TranscriptServer {
@@ -216,8 +195,8 @@ class TranscriptServer {
     this.extractor = new YouTubeTranscriptExtractor();
     this.server = new Server(
       {
-        name: "mcp-servers-youtube-transcript",
-        version: "0.1.0",
+        name: "mcp-server-youtube-transcript",
+        version: "0.2.0",
       },
       {
         capabilities: {
@@ -268,19 +247,17 @@ class TranscriptServer {
           );
         }
 
-        if (lang && typeof lang !== 'string') {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'Language code must be a string'
-          );
+        const langError = validateLanguageCode(lang);
+        if (langError) {
+          throw new McpError(ErrorCode.InvalidParams, langError);
         }
 
         try {
           const videoId = this.extractor.extractYoutubeId(input);
-          console.log(`Processing transcript for video: ${videoId}, lang: ${lang}, timestamps: ${include_timestamps}, strip_ads: ${strip_ads}`);
+          console.error(`Processing transcript for video: ${videoId}, lang: ${lang}, timestamps: ${include_timestamps}, strip_ads: ${strip_ads}`);
 
           const result = await this.extractor.getTranscript(videoId, lang, include_timestamps, strip_ads);
-          console.log(`Successfully extracted transcript (${result.text.length} chars, lang: ${result.actualLang}, ads stripped: ${result.adsStripped})`);
+          console.error(`Successfully extracted transcript (${result.text.length} chars, lang: ${result.actualLang}, ads stripped: ${result.adsStripped})`);
 
           // Build transcript with notes
           let transcript = result.text;
@@ -352,10 +329,44 @@ class TranscriptServer {
   }
 }
 
+/**
+ * Verify that yt-dlp is on the user's PATH before we try to use it.
+ * Writes a clear, actionable error to stderr and exits non-zero if missing,
+ * so the failure surfaces in the host's MCP log instead of as an opaque
+ * tool-call error per request.
+ */
+async function checkYtDlp(): Promise<void> {
+  try {
+    await execFile("yt-dlp", ["--version"], { timeout: 5000 });
+  } catch {
+    const lines = [
+      "",
+      "─────────────────────────────────────────────────────────────",
+      "  ERROR: yt-dlp not found on PATH",
+      "─────────────────────────────────────────────────────────────",
+      "",
+      "  This MCP server requires yt-dlp to be installed locally.",
+      "  Install it with one of:",
+      "",
+      "    macOS:    brew install yt-dlp",
+      "    Windows:  winget install yt-dlp.yt-dlp",
+      "    Linux:    pipx install yt-dlp",
+      "",
+      "  After installing, verify with: yt-dlp --version",
+      "─────────────────────────────────────────────────────────────",
+      "",
+    ];
+    for (const line of lines) console.error(line);
+    process.exit(1);
+  }
+}
+
 // Main execution
 async function main() {
+  await checkYtDlp();
+
   const server = new TranscriptServer();
-  
+
   try {
     await server.start();
   } catch (error) {

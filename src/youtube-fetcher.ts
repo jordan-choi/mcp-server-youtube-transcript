@@ -1,10 +1,32 @@
-import https from 'https';
+// Data-source layer. Delegates all YouTube interaction to the `yt-dlp`
+// CLI binary on the user's PATH, then shapes the result into the same
+// SubtitleResult contract the previous regex-based scraper exposed.
+//
+// Two stages per call:
+//   1. `yt-dlp -J --skip-download URL` → metadata, chapters, available subs.
+//   2. `yt-dlp --write-subs --write-auto-subs --sub-lang LANG --sub-format vtt
+//       --skip-download --paths TMP URL` → VTT file in a tempdir; we read
+//       and parse it, then clean up the tempdir.
+//
+// Subprocess + filesystem operations use Node stdlib only (execFile, fs.rm,
+// fs.mkdtemp, fs.readdir, fs.readFile) — no spawn-rx, no rimraf.
+//
+// The yt-dlp delegation pattern is borrowed from anaisbetts/mcp-youtube.
 
-interface TranscriptLine {
-  text: string;
-  start: number;
-  dur: number;
-}
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { parseVtt, TranscriptLine } from "./vtt-parser.js";
+
+const execFile = promisify(execFileCallback);
 
 export interface CaptionTrack {
   languageCode: string;
@@ -26,225 +48,6 @@ export interface VideoMetadata {
   publishDate: string;
 }
 
-interface PageData {
-  visitorData: string;
-  clientVersion: string;
-  availableLanguages: CaptionTrack[];
-  adChapters: AdChapter[];
-  metadata: VideoMetadata;
-}
-
-const REQUEST_TIMEOUT = 30000; // 30 seconds
-
-// TODO: These versions may need periodic updates if YouTube starts rejecting old clients
-// The ANDROID client is used to bypass YouTube's poToken A/B test enforcement
-const ANDROID_CLIENT_VERSION = '19.29.37';
-const ANDROID_USER_AGENT = `com.google.android.youtube/${ANDROID_CLIENT_VERSION} (Linux; U; Android 11) gzip`;
-const WEB_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const DEFAULT_CLIENT_VERSION = '2.20251201.01.00'; // Fallback if not extracted from page
-
-/**
- * Encodes a number as a protobuf varint
- * Handles lengths > 127 correctly (multi-byte encoding)
- */
-function encodeVarint(value: number): number[] {
-  const bytes: number[] = [];
-  while (value > 0x7f) {
-    bytes.push((value & 0x7f) | 0x80);
-    value >>>= 7;
-  }
-  bytes.push(value);
-  return bytes;
-}
-
-/**
- * Builds the protobuf-encoded params for the transcript API
- */
-function buildParams(videoId: string, lang: string = 'en'): string {
-  // Inner protobuf: language params
-  // Field 1: "asr" (auto speech recognition)
-  // Field 2: language code
-  // Field 3: empty string
-  const innerParts: number[] = [
-    0x0a, 0x03, ...Buffer.from('asr'),           // Field 1, "asr"
-    0x12, ...encodeVarint(lang.length), ...Buffer.from(lang),  // Field 2, language code
-    0x1a, 0x00                                    // Field 3, empty
-  ];
-  const innerBuf = Buffer.from(innerParts);
-  const innerB64 = innerBuf.toString('base64');
-  const innerEncoded = encodeURIComponent(innerB64);
-
-  // Outer protobuf
-  const panelName = 'engagement-panel-searchable-transcript-search-panel';
-  const outerParts: number[] = [
-    0x0a, ...encodeVarint(videoId.length), ...Buffer.from(videoId),      // Field 1, video ID
-    0x12, ...encodeVarint(innerEncoded.length), ...Buffer.from(innerEncoded), // Field 2, language params
-    0x18, 0x01,                                          // Field 3, value 1
-    0x2a, ...encodeVarint(panelName.length), ...Buffer.from(panelName),  // Field 5, panel name
-    0x30, 0x01,                                          // Field 6, value 1
-    0x38, 0x01,                                          // Field 7, value 1
-    0x40, 0x01                                           // Field 8, value 1
-  ];
-
-  return Buffer.from(outerParts).toString('base64');
-}
-
-/**
- * Makes an HTTPS request and returns the response body
- * Includes timeout and HTTP status code validation
- */
-function httpsRequest(options: https.RequestOptions, data?: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const req = https.request({ ...options, timeout: REQUEST_TIMEOUT }, (res) => {
-      // Validate HTTP status code
-      if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
-        reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage || 'Unknown error'}`));
-        return;
-      }
-
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => resolve(body));
-    });
-
-    req.on('error', (err) => {
-      reject(new Error(`Network error: ${err.message}`));
-    });
-
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error(`Request timeout after ${REQUEST_TIMEOUT}ms`));
-    });
-
-    if (data) req.write(data);
-    req.end();
-  });
-}
-
-/**
- * Fetches the YouTube video page and extracts visitor data and client version
- */
-async function getPageData(videoId: string): Promise<PageData> {
-  let html: string;
-
-  try {
-    html = await httpsRequest({
-      hostname: 'www.youtube.com',
-      path: `/watch?v=${videoId}`,
-      method: 'GET',
-      headers: {
-        'User-Agent': WEB_USER_AGENT,
-        'Accept-Language': 'en-US,en;q=0.9'
-      }
-    });
-  } catch (err) {
-    throw new Error(`Failed to fetch video page: ${(err as Error).message}`);
-  }
-
-  // Extract visitor data
-  const visitorMatch = html.match(/"visitorData":"([^"]+)"/);
-  const visitorData = visitorMatch?.[1] || '';
-
-  if (!visitorData) {
-    console.error(`[youtube-fetcher] Warning: Could not extract visitorData for video ${videoId}. Request may fail.`);
-  }
-
-  // Extract client version (format: "2.YYYYMMDD.XX.XX")
-  const versionMatch = html.match(/"clientVersion":"([\d.]+)"/);
-  const clientVersion = versionMatch?.[1] || DEFAULT_CLIENT_VERSION;
-
-  // Extract available caption tracks
-  const availableLanguages: CaptionTrack[] = [];
-  const captionsMatch = html.match(/"captions":\{"playerCaptionsTracklistRenderer":\{"captionTracks":(\[[^\]]+\])/);
-  if (captionsMatch) {
-    try {
-      const tracks = JSON.parse(captionsMatch[1]);
-      for (const track of tracks) {
-        if (track.languageCode) {
-          availableLanguages.push({
-            languageCode: track.languageCode,
-            name: track.name?.simpleText || track.name?.runs?.[0]?.text || track.languageCode,
-            isAutoGenerated: track.kind === 'asr'
-          });
-        }
-      }
-    } catch (e) {
-      console.error(`[youtube-fetcher] Warning: Could not parse caption tracks for video ${videoId}`);
-    }
-  }
-
-  // Extract chapters and identify ad chapters
-  const adChapters: AdChapter[] = [];
-  const adMarkers = [
-    '(werbung)', '(ad)', '(ads)', '(sponsor)', '(sponsored)',
-    '(promo)', '(promotion)', '(anzeige)', '(reklame)',
-    '[werbung]', '[ad]', '[ads]', '[sponsor]', '[sponsored]',
-    '[promo]', '[promotion]', '[anzeige]', '[reklame]'
-  ];
-
-  // Extract chapters from chapterRenderer elements
-  const chapterMatches = [...html.matchAll(/"chapterRenderer":\s*\{[^}]*"title":\s*\{\s*"simpleText":\s*"([^"]+)"[^}]*\}[^}]*"timeRangeStartMillis":\s*"?(\d+)"?/g)];
-
-  interface Chapter {
-    title: string;
-    startMs: number;
-    isAd: boolean;
-  }
-
-  const chapters: Chapter[] = chapterMatches.map(match => ({
-    title: match[1],
-    startMs: parseInt(match[2], 10),
-    isAd: adMarkers.some(marker => match[1].toLowerCase().includes(marker))
-  }));
-
-  // Convert ad chapters to AdChapter format with end times
-  for (let i = 0; i < chapters.length; i++) {
-    if (chapters[i].isAd) {
-      const nextChapter = chapters[i + 1];
-      // End time is start of next chapter, or +5 minutes if last chapter
-      const endMs = nextChapter ? nextChapter.startMs : chapters[i].startMs + 300000;
-      adChapters.push({
-        title: chapters[i].title,
-        startMs: chapters[i].startMs,
-        endMs: endMs
-      });
-    }
-  }
-
-  // Extract video metadata (target videoDetails block, use .*? for nested objects)
-  const titleMatch = html.match(/"videoDetails":\{.*?"title":"([^"]+)"/);
-  const authorMatch = html.match(/"videoDetails":\{.*?"author":"([^"]+)"/);
-  const subsMatch = html.match(/"subscriberCountText":\{"accessibility":\{"accessibilityData":\{"label":"([^"]+)"/);
-  const viewsMatch = html.match(/"viewCount":"(\d+)"/);
-  const dateMatch = html.match(/"publishDate":"([^"]+)"/);
-
-  // Shorten subscriber count: "649 thousand subscribers" → "649k"
-  let subs = subsMatch?.[1] || '';
-  subs = subs.replace(/ subscribers?/i, '').replace(/ thousand/i, 'k').replace(/ million/i, 'M').replace(/ billion/i, 'B');
-
-  // Format view count: 22205 → "22.2k" (explicit NaN handling)
-  const views = viewsMatch?.[1] || '';
-  const viewNum = parseInt(views, 10);
-  const viewsFormatted = Number.isNaN(viewNum) ? ''
-    : viewNum >= 1_000_000 ? (viewNum / 1_000_000).toFixed(1) + 'M'
-    : viewNum >= 1_000 ? (viewNum / 1_000).toFixed(1) + 'k'
-    : views;
-
-  // Shorten date: "2025-12-03T03:01:16-08:00" → "2025-12-03"
-  const dateRaw = dateMatch?.[1] || '';
-  const dateShort = dateRaw.split('T')[0];
-
-  const metadata: VideoMetadata = {
-    title: titleMatch?.[1] || '',
-    author: authorMatch?.[1] || '',
-    subscriberCount: subs,
-    viewCount: viewsFormatted,
-    publishDate: dateShort
-  };
-
-  return { visitorData, clientVersion, availableLanguages, adChapters, metadata };
-}
-
 export interface SubtitleResult {
   lines: TranscriptLine[];
   requestedLang: string;
@@ -254,143 +57,432 @@ export interface SubtitleResult {
   metadata: VideoMetadata;
 }
 
-/**
- * Returns available caption languages for a video without fetching the full transcript
- */
-export async function getAvailableLanguages(videoID: string): Promise<CaptionTrack[]> {
-  if (!videoID || typeof videoID !== 'string') {
-    throw new Error('Invalid video ID: must be a non-empty string');
-  }
-  const { availableLanguages } = await getPageData(videoID);
-  return availableLanguages;
+const YT_DLP_TIMEOUT_MS = 60_000;
+// yt-dlp -J output for long videos can be megabytes (chapters, formats, etc).
+const YT_DLP_MAX_BUFFER = 64 * 1024 * 1024;
+// End-time fallback when an ad chapter is the last chapter in the video.
+const TRAILING_AD_FALLBACK_MS = 5 * 60 * 1000;
+
+const AD_MARKERS: ReadonlyArray<string> = [
+  "(werbung)", "(ad)", "(ads)", "(sponsor)", "(sponsored)",
+  "(promo)", "(promotion)", "(anzeige)", "(reklame)",
+  "[werbung]", "[ad]", "[ads]", "[sponsor]", "[sponsored]",
+  "[promo]", "[promotion]", "[anzeige]", "[reklame]",
+];
+
+// SponsorBlock — community-labeled sponsor segment database.
+// We call the public API directly because yt-dlp's --sponsorblock-mark flag
+// only injects chapters when yt-dlp is post-processing a downloaded video.
+// With --skip-download (our case), that post-processing step never runs and
+// the SponsorBlock data is silently dropped.
+const SPONSORBLOCK_API_URL = "https://sponsor.ajay.app/api/skipSegments";
+// Categories we treat as ad-equivalent. `sponsor` covers paid promotions;
+// `selfpromo` covers the creator's own merch / Patreon / channel pitches.
+// Other categories (intro, outro, interaction, preview, music_offtopic,
+// filler) carry useful content and are deliberately excluded.
+const SPONSORBLOCK_CATEGORIES = ["sponsor", "selfpromo"] as const;
+// Action types we filter on. `skip` is a hard-skip ad; `mute` is a muted
+// segment (still an ad, just shorter / in-place). Other action types
+// (`poi`, `chapter`, `full`) are not ad-related and shouldn't be filtered.
+const SPONSORBLOCK_ACTION_TYPES = new Set(["skip", "mute"]);
+const SPONSORBLOCK_TIMEOUT_MS = 10_000;
+
+export interface YtDlpInfo {
+  title?: string;
+  uploader?: string;
+  channel?: string;
+  channel_follower_count?: number;
+  view_count?: number;
+  upload_date?: string; // YYYYMMDD
+  subtitles?: Record<string, unknown>;
+  automatic_captions?: Record<string, unknown>;
+  chapters?: Array<{
+    start_time: number;
+    end_time?: number;
+    title: string;
+  }>;
 }
 
 /**
- * Fetches transcript using the YouTube internal API
- * If the requested language is not available and enableFallback is true,
- * it will try English first, then fall back to the first available language.
+ * Wraps a child_process error so the message exposes yt-dlp's actual reason
+ * for failing instead of just "Command failed".
+ *
+ * yt-dlp emits two kinds of lines on stderr: warnings (`WARNING: …`, e.g.
+ * "ffmpeg not found") and errors (`ERROR: …`, e.g. "Requested format is not
+ * available"). Warnings often print BEFORE the real error, so simply taking
+ * the first line of stderr surfaces noise. We:
+ *
+ *   1. Prefer the first `ERROR: …` line if any — this is yt-dlp's actual
+ *      top-level failure reason.
+ *   2. Otherwise return the first non-warning, non-empty line (some yt-dlp
+ *      failures print no `ERROR:` prefix at all).
+ *   3. Otherwise fall back to the first non-empty line, which is then
+ *      probably a warning we want to surface anyway.
+ */
+export function describeYtDlpError(err: unknown): string {
+  if (err == null || typeof err !== "object") {
+    return typeof err === "string" ? err : String(err);
+  }
+  const e = err as { stderr?: unknown; message?: unknown };
+  const stderr = typeof e.stderr === "string" ? e.stderr.trim() : "";
+  if (stderr) {
+    const lines = stderr.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    const errorLine = lines.find((l) => /^ERROR:/i.test(l));
+    if (errorLine) return errorLine.replace(/^ERROR:\s*/i, "");
+    const nonWarning = lines.find((l) => !/^WARNING:/i.test(l));
+    if (nonWarning) return nonWarning;
+    if (lines[0]) return lines[0];
+  }
+  return typeof e.message === "string" ? e.message : String(err);
+}
+
+/**
+ * Run `yt-dlp -J --skip-download URL` and parse the metadata JSON.
+ */
+async function fetchVideoInfo(url: string): Promise<YtDlpInfo> {
+  let stdout: string;
+  try {
+    const result = await execFile(
+      "yt-dlp",
+      ["-J", "--skip-download", url],
+      { timeout: YT_DLP_TIMEOUT_MS, maxBuffer: YT_DLP_MAX_BUFFER },
+    );
+    stdout = result.stdout;
+  } catch (err) {
+    throw new Error(`yt-dlp metadata fetch failed: ${describeYtDlpError(err)}`);
+  }
+
+  try {
+    return JSON.parse(stdout) as YtDlpInfo;
+  } catch (err) {
+    throw new Error(
+      `yt-dlp returned non-JSON output: ${(err as Error).message}. Preview: ${stdout.slice(0, 200)}`,
+    );
+  }
+}
+
+/**
+ * Flatten yt-dlp's manual `subtitles` and `automatic_captions` maps into a
+ * single CaptionTrack[]. Manual entries take precedence when the same
+ * language code appears in both.
+ */
+export function extractCaptionTracks(info: YtDlpInfo): CaptionTrack[] {
+  const tracks: CaptionTrack[] = [];
+  const seen = new Set<string>();
+
+  for (const code of Object.keys(info.subtitles || {})) {
+    if (!seen.has(code)) {
+      tracks.push({ languageCode: code, name: code, isAutoGenerated: false });
+      seen.add(code);
+    }
+  }
+
+  for (const code of Object.keys(info.automatic_captions || {})) {
+    if (!seen.has(code)) {
+      tracks.push({ languageCode: code, name: code, isAutoGenerated: true });
+      seen.add(code);
+    }
+  }
+
+  return tracks;
+}
+
+/**
+ * Convert SponsorBlock's `/api/skipSegments` response into AdChapter[].
+ * Exported so the parsing can be unit-tested with hand-rolled fixtures.
+ *
+ * Filters defensively:
+ *   - Only segments with a [start, end] number tuple are kept.
+ *   - Only `skip` and `mute` action types — other types (`poi`, `chapter`,
+ *     `full`) are not ads and shouldn't be filtered out.
+ *
+ * Each surviving segment becomes an AdChapter titled
+ * `[SponsorBlock]: <category>` so the chapter list stays self-describing.
+ */
+export function parseSponsorBlockResponse(json: unknown): AdChapter[] {
+  if (!Array.isArray(json)) return [];
+
+  const out: AdChapter[] = [];
+  for (const raw of json) {
+    if (raw == null || typeof raw !== "object") continue;
+    const entry = raw as {
+      category?: unknown;
+      actionType?: unknown;
+      segment?: unknown;
+    };
+
+    const segment = entry.segment;
+    if (!Array.isArray(segment) || segment.length !== 2) continue;
+    const [startSec, endSec] = segment;
+    if (typeof startSec !== "number" || typeof endSec !== "number") continue;
+    if (!(endSec > startSec)) continue;
+
+    const actionType =
+      typeof entry.actionType === "string" ? entry.actionType : "skip";
+    if (!SPONSORBLOCK_ACTION_TYPES.has(actionType)) continue;
+
+    const category =
+      typeof entry.category === "string" && entry.category.length > 0
+        ? entry.category
+        : "segment";
+
+    out.push({
+      title: `[SponsorBlock]: ${category}`,
+      startMs: Math.round(startSec * 1000),
+      endMs: Math.round(endSec * 1000),
+    });
+  }
+  return out;
+}
+
+/**
+ * Hit SponsorBlock's `/api/skipSegments` for the given video and return its
+ * sponsor-categorised segments as AdChapter[]. Network failures, 404s, and
+ * malformed responses all degrade to an empty array — strip_ads is best
+ * effort, never fatal.
+ */
+async function fetchSponsorBlockSegments(
+  videoID: string,
+): Promise<AdChapter[]> {
+  const params = new URLSearchParams({
+    videoID,
+    categories: JSON.stringify(SPONSORBLOCK_CATEGORIES),
+  });
+  const url = `${SPONSORBLOCK_API_URL}?${params.toString()}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      signal: AbortSignal.timeout(SPONSORBLOCK_TIMEOUT_MS),
+      headers: { "User-Agent": "mcp-server-youtube-transcript" },
+    });
+  } catch (err) {
+    console.error(
+      `[youtube-fetcher] SponsorBlock fetch failed: ${(err as Error).message}`,
+    );
+    return [];
+  }
+
+  // 404 = no segments labeled for this video — common, not an error.
+  if (response.status === 404) return [];
+  if (!response.ok) {
+    console.error(
+      `[youtube-fetcher] SponsorBlock returned HTTP ${response.status}`,
+    );
+    return [];
+  }
+
+  let json: unknown;
+  try {
+    json = await response.json();
+  } catch (err) {
+    console.error(
+      `[youtube-fetcher] SponsorBlock returned non-JSON: ${(err as Error).message}`,
+    );
+    return [];
+  }
+
+  return parseSponsorBlockResponse(json);
+}
+
+/**
+ * Pick out chapters whose title matches one of the ad markers. End time
+ * comes from the chapter's own end_time, or the next chapter's start, or a
+ * 5-minute fallback for a trailing ad chapter.
+ */
+export function extractAdChapters(info: YtDlpInfo): AdChapter[] {
+  const chapters = info.chapters || [];
+  const adChapters: AdChapter[] = [];
+
+  for (let i = 0; i < chapters.length; i++) {
+    const chapter = chapters[i];
+    const titleLower = (chapter.title || "").toLowerCase();
+    const isAd = AD_MARKERS.some((marker) => titleLower.includes(marker));
+    if (!isAd) continue;
+
+    const next = chapters[i + 1];
+    const endSeconds =
+      typeof chapter.end_time === "number"
+        ? chapter.end_time
+        : next?.start_time ?? chapter.start_time + TRAILING_AD_FALLBACK_MS / 1000;
+
+    adChapters.push({
+      title: chapter.title,
+      startMs: Math.round(chapter.start_time * 1000),
+      endMs: Math.round(endSeconds * 1000),
+    });
+  }
+
+  return adChapters;
+}
+
+function shorten(value: number): string {
+  if (value >= 1_000_000) return (value / 1_000_000).toFixed(1) + "M";
+  if (value >= 1_000) return (value / 1_000).toFixed(1) + "k";
+  return String(value);
+}
+
+export function extractMetadata(info: YtDlpInfo): VideoMetadata {
+  const subs =
+    typeof info.channel_follower_count === "number"
+      ? shorten(info.channel_follower_count)
+      : "";
+
+  const views =
+    typeof info.view_count === "number" ? shorten(info.view_count) : "";
+
+  const date = info.upload_date || "";
+  const publishDate =
+    date.length === 8
+      ? `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`
+      : "";
+
+  return {
+    title: info.title || "",
+    author: info.uploader || info.channel || "",
+    subscriberCount: subs,
+    viewCount: views,
+    publishDate,
+  };
+}
+
+/**
+ * Returns available caption languages for a video without fetching the full
+ * transcript.
+ */
+export async function getAvailableLanguages(
+  videoID: string,
+): Promise<CaptionTrack[]> {
+  if (!videoID || typeof videoID !== "string") {
+    throw new Error("Invalid video ID: must be a non-empty string");
+  }
+  const info = await fetchVideoInfo(`https://www.youtube.com/watch?v=${videoID}`);
+  return extractCaptionTracks(info);
+}
+
+/**
+ * Fetches the transcript for the given video and language.
+ *
+ * If the requested language is not available and `enableFallback` is true,
+ * tries English first, then falls back to the first available language.
+ *
+ * When `useSponsorBlock` is true, the metadata fetch also queries
+ * SponsorBlock so its segments appear as chapters and the existing
+ * ad-stripping path can filter them out. The flag is opt-in (the caller
+ * passes the user's `strip_ads` preference) so users who decline ad
+ * filtering don't trigger a third-party network call to sponsor.ajay.app.
  */
 export async function getSubtitles(options: {
   videoID: string;
   lang?: string;
   enableFallback?: boolean;
+  useSponsorBlock?: boolean;
 }): Promise<SubtitleResult> {
-  const { videoID, lang = 'en', enableFallback = true } = options;
+  const {
+    videoID,
+    lang = "en",
+    enableFallback = true,
+    useSponsorBlock = false,
+  } = options;
 
-  // Validate video ID format
-  if (!videoID || typeof videoID !== 'string') {
-    throw new Error('Invalid video ID: must be a non-empty string');
+  if (!videoID || typeof videoID !== "string") {
+    throw new Error("Invalid video ID: must be a non-empty string");
   }
 
-  // Get page data (visitor data needed for API authentication)
-  const { visitorData, availableLanguages, adChapters, metadata } = await getPageData(videoID);
+  const url = `https://www.youtube.com/watch?v=${videoID}`;
 
-  // Determine which language to use
+  // Stage 1 — metadata + (optionally) SponsorBlock, in parallel. The
+  // SponsorBlock fetch is independent of yt-dlp, so we don't pay a serial
+  // round-trip for it. If the user opted out (strip_ads=false), we don't
+  // hit SponsorBlock at all.
+  const [info, sponsorBlockChapters] = await Promise.all([
+    fetchVideoInfo(url),
+    useSponsorBlock
+      ? fetchSponsorBlockSegments(videoID)
+      : Promise.resolve<AdChapter[]>([]),
+  ]);
+  const availableLanguages = extractCaptionTracks(info);
+  // Union creator-marked chapters with SponsorBlock segments. Both sources
+  // can be sparse / wrong; using both maximises coverage.
+  const adChapters = [...extractAdChapters(info), ...sponsorBlockChapters];
+  const metadata = extractMetadata(info);
+
+  // Pick target language with fallback.
   let targetLang = lang;
-
   if (availableLanguages.length > 0) {
-    const hasRequestedLang = availableLanguages.some(t => t.languageCode === lang);
+    const hasRequested = availableLanguages.some(
+      (t) => t.languageCode === lang,
+    );
 
-    if (!hasRequestedLang && enableFallback) {
-      // Try English first
-      const hasEnglish = availableLanguages.some(t => t.languageCode === 'en');
+    if (!hasRequested && enableFallback) {
+      const hasEnglish = availableLanguages.some(
+        (t) => t.languageCode === "en",
+      );
       if (hasEnglish) {
-        targetLang = 'en';
-        console.error(`[youtube-fetcher] Language '${lang}' not available, falling back to 'en'`);
+        targetLang = "en";
+        console.error(
+          `[youtube-fetcher] Language '${lang}' not available, falling back to 'en'`,
+        );
       } else {
-        // Use first available
         targetLang = availableLanguages[0].languageCode;
-        console.error(`[youtube-fetcher] Language '${lang}' not available, falling back to '${targetLang}'`);
+        console.error(
+          `[youtube-fetcher] Language '${lang}' not available, falling back to '${targetLang}'`,
+        );
       }
-    } else if (!hasRequestedLang) {
-      throw new Error(`Language '${lang}' not available. Available: ${availableLanguages.map(t => t.languageCode).join(', ')}`);
+    } else if (!hasRequested) {
+      throw new Error(
+        `Language '${lang}' not available. Available: ${availableLanguages.map((t) => t.languageCode).join(", ")}`,
+      );
     }
   }
 
-  // Build request payload using ANDROID client to avoid FAILED_PRECONDITION errors
-  // The ANDROID client bypasses YouTube's A/B test for poToken enforcement
-  const params = buildParams(videoID, targetLang);
-  const payload = JSON.stringify({
-    context: {
-      client: {
-        hl: targetLang,
-        gl: 'US',
-        clientName: 'ANDROID',
-        clientVersion: ANDROID_CLIENT_VERSION,
-        androidSdkVersion: 30,
-        visitorData: visitorData
-      }
-    },
-    params: params
-  });
+  // Stage 2 — download the VTT for the chosen language into a tempdir.
+  const tempDir = await mkdtemp(join(tmpdir(), "youtube-transcript-"));
+  let lines: TranscriptLine[] = [];
 
-  // Make API request
-  let response: string;
   try {
-    response = await httpsRequest({
-      hostname: 'www.youtube.com',
-      path: '/youtubei/v1/get_transcript?prettyPrint=false',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        'User-Agent': ANDROID_USER_AGENT,
-        'Origin': 'https://www.youtube.com'
-      }
-    }, payload);
-  } catch (err) {
-    throw new Error(`Failed to fetch transcript API: ${(err as Error).message}`);
+    try {
+      await execFile(
+        "yt-dlp",
+        [
+          "--write-subs",
+          "--write-auto-subs",
+          "--sub-lang",
+          targetLang,
+          "--sub-format",
+          "vtt",
+          "--skip-download",
+          "-o",
+          "%(id)s.%(ext)s",
+          "--paths",
+          tempDir,
+          url,
+        ],
+        { timeout: YT_DLP_TIMEOUT_MS, maxBuffer: YT_DLP_MAX_BUFFER },
+      );
+    } catch (err) {
+      throw new Error(
+        `yt-dlp subtitle download failed: ${describeYtDlpError(err)}`,
+      );
+    }
+
+    const files = await readdir(tempDir);
+    const vttFile = files.find((name) => name.endsWith(".vtt"));
+    if (!vttFile) {
+      throw new Error(
+        "No transcript available for this video. The video may not have captions enabled.",
+      );
+    }
+
+    const vttContent = await readFile(join(tempDir, vttFile), "utf-8");
+    lines = parseVtt(vttContent);
+
+    if (lines.length === 0) {
+      throw new Error("Transcript file was empty after parsing.");
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
   }
-
-  // Parse response with error handling
-  let json: any;
-  try {
-    json = JSON.parse(response);
-  } catch (err) {
-    throw new Error(`Failed to parse YouTube API response: ${(err as Error).message}. Response preview: ${response.substring(0, 200)}`);
-  }
-
-  // Check for API-level errors
-  if (json.error) {
-    const errorMsg = json.error.message || json.error.code || 'Unknown API error';
-    throw new Error(`YouTube API error: ${errorMsg}`);
-  }
-
-  // Extract transcript segments - handle both WEB and ANDROID response formats
-  const webSegments = json?.actions?.[0]?.updateEngagementPanelAction?.content
-    ?.transcriptRenderer?.content?.transcriptSearchPanelRenderer?.body
-    ?.transcriptSegmentListRenderer?.initialSegments;
-
-  const androidSegments = json?.actions?.[0]?.elementsCommand?.transformEntityCommand
-    ?.arguments?.transformTranscriptSegmentListArguments?.overwrite?.initialSegments;
-
-  const segments = webSegments || androidSegments || [];
-
-  if (segments.length === 0) {
-    throw new Error('No transcript available for this video. The video may not have captions enabled.');
-  }
-
-  // Convert to TranscriptLine format
-  const lines = segments
-    .filter((seg: any) => seg?.transcriptSegmentRenderer) // Skip section headers
-    .map((seg: any) => {
-      const renderer = seg.transcriptSegmentRenderer;
-
-      // Handle both WEB format (snippet.runs) and ANDROID format (snippet.elementsAttributedString)
-      const webText = renderer?.snippet?.runs?.map((r: any) => r.text || '').join('');
-      const androidText = renderer?.snippet?.elementsAttributedString?.content;
-      const text = webText || androidText || '';
-
-      const startMs = parseInt(renderer?.startMs || '0', 10);
-      const endMs = parseInt(renderer?.endMs || '0', 10);
-
-      return {
-        text: text,
-        start: startMs / 1000,
-        dur: (endMs - startMs) / 1000
-      };
-    })
-    .filter((line: TranscriptLine) => line.text.length > 0);
 
   return {
     lines,
@@ -398,6 +490,6 @@ export async function getSubtitles(options: {
     actualLang: targetLang,
     availableLanguages,
     adChapters,
-    metadata
+    metadata,
   };
 }
