@@ -46,7 +46,7 @@ Add this entry to your MCP host configuration (e.g. `~/Library/Application Suppo
   "mcpServers": {
     "youtube-transcript": {
       "command": "npx",
-      "args": ["-y", "@jordan-choi/mcp-server-youtube-transcript"]
+      "args": ["-y", "@jordanchoi/mcp-server-youtube-transcript"]
     }
   }
 }
