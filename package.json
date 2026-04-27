@@ -1,6 +1,6 @@
 {
   "name": "@jordanchoi/mcp-server-youtube-transcript",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server that returns YouTube video transcripts via yt-dlp, with SponsorBlock-based ad filtering and per-sentence timestamps. Forked from @kimtaeyoon83/mcp-server-youtube-transcript.",
   "license": "MIT",
   "author": "Jordan Choi",
@@ -30,7 +30,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.9.0",
-    "mcp-evals": "^1.0.18"
+    "mcp-evals": "^1.0.18",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^20.11.24",
