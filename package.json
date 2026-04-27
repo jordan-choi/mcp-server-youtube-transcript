@@ -1,11 +1,17 @@
 {
-  "name": "@kimtaeyoon83/mcp-server-youtube-transcript",
+  "name": "@jordan-choi/mcp-server-youtube-transcript",
   "version": "0.1.1",
-  "description": "This is an MCP server that allows you to directly download transcripts of YouTube videos.",
+  "description": "MCP server that returns YouTube video transcripts via yt-dlp, with SponsorBlock-based ad filtering and per-sentence timestamps. Forked from @kimtaeyoon83/mcp-server-youtube-transcript.",
   "license": "MIT",
-  "author": "Freddie",
-  "homepage": "https://github.com/kimtaeyoon83/mcp-server-youtube-transcript",
-  "bugs": "https://github.com/kimtaeyoon83/mcp-server-youtube-transcript/issues",
+  "author": "Jordan Choi",
+  "homepage": "https://github.com/jordan-choi/mcp-server-youtube-transcript#readme",
+  "bugs": {
+    "url": "https://github.com/jordan-choi/mcp-server-youtube-transcript/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jordan-choi/mcp-server-youtube-transcript.git"
+  },
   "access": "public",
   "type": "module",
   "main": "dist/index.js",

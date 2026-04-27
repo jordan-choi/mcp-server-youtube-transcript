@@ -195,7 +195,7 @@ class TranscriptServer {
     this.extractor = new YouTubeTranscriptExtractor();
     this.server = new Server(
       {
-        name: "mcp-servers-youtube-transcript",
+        name: "mcp-server-youtube-transcript",
         version: "0.1.0",
       },
       {
