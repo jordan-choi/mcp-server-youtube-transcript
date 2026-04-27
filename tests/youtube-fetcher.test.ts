@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  describeYtDlpError,
   extractAdChapters,
   extractCaptionTracks,
   extractMetadata,
@@ -299,5 +300,69 @@ describe("parseSponsorBlockResponse", () => {
     const ads = parseSponsorBlockResponse(payload);
     assert.equal(ads.length, 1);
     assert.equal(ads[0].title, "[SponsorBlock]: segment");
+  });
+});
+
+describe("describeYtDlpError", () => {
+  // Mimics what `util.promisify(child_process.execFile)` rejects with:
+  // an Error subclass whose `stderr` property is the captured stderr.
+  const wrap = (stderr: string): Error => {
+    const err = new Error("Command failed") as Error & { stderr?: string };
+    err.stderr = stderr;
+    return err;
+  };
+
+  it("returns the first ERROR: line, with the prefix stripped", () => {
+    const stderr = `WARNING: ffmpeg not found.
+ERROR: Requested format is not available
+trace line
+`;
+    assert.equal(
+      describeYtDlpError(wrap(stderr)),
+      "Requested format is not available",
+    );
+  });
+
+  it("prefers the ERROR line even when the warning came first", () => {
+    // The bug we hit in the field: ffmpeg warning prints first, real error
+    // later. We must surface the error.
+    const stderr = `WARNING: ffmpeg not found. The downloaded format may not be the best available. Installing ffmpeg is strongly recommended: https://github.com/yt-dlp/yt-dlp#dependencies
+ERROR: [youtube] DriDJyULb8s: Requested subtitle 'kor' not available
+`;
+    assert.equal(
+      describeYtDlpError(wrap(stderr)),
+      "[youtube] DriDJyULb8s: Requested subtitle 'kor' not available",
+    );
+  });
+
+  it("falls back to the first non-warning line when no ERROR: line exists", () => {
+    const stderr = `WARNING: ffmpeg not found.
+[youtube] some non-warning trace
+`;
+    assert.equal(
+      describeYtDlpError(wrap(stderr)),
+      "[youtube] some non-warning trace",
+    );
+  });
+
+  it("falls back to the first warning if that's all there is", () => {
+    const stderr = `WARNING: ffmpeg not found.
+WARNING: another harmless warning
+`;
+    assert.equal(
+      describeYtDlpError(wrap(stderr)),
+      "WARNING: ffmpeg not found.",
+    );
+  });
+
+  it("falls back to err.message when stderr is empty", () => {
+    const e = new Error("spawn ENOENT") as Error & { stderr?: string };
+    e.stderr = "";
+    assert.equal(describeYtDlpError(e), "spawn ENOENT");
+  });
+
+  it("handles a non-Error value defensively", () => {
+    assert.equal(describeYtDlpError("just a string"), "just a string");
+    assert.equal(describeYtDlpError(null), "null");
   });
 });

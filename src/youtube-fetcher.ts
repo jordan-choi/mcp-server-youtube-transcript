@@ -104,18 +104,36 @@ export interface YtDlpInfo {
 }
 
 /**
- * Wraps a child_process error so the message exposes yt-dlp's stderr instead
- * of just "Command failed". We only keep the first non-empty stderr line —
- * that's where yt-dlp puts its top-level reason ("ERROR: …").
+ * Wraps a child_process error so the message exposes yt-dlp's actual reason
+ * for failing instead of just "Command failed".
+ *
+ * yt-dlp emits two kinds of lines on stderr: warnings (`WARNING: …`, e.g.
+ * "ffmpeg not found") and errors (`ERROR: …`, e.g. "Requested format is not
+ * available"). Warnings often print BEFORE the real error, so simply taking
+ * the first line of stderr surfaces noise. We:
+ *
+ *   1. Prefer the first `ERROR: …` line if any — this is yt-dlp's actual
+ *      top-level failure reason.
+ *   2. Otherwise return the first non-warning, non-empty line (some yt-dlp
+ *      failures print no `ERROR:` prefix at all).
+ *   3. Otherwise fall back to the first non-empty line, which is then
+ *      probably a warning we want to surface anyway.
  */
-function describeYtDlpError(err: unknown): string {
-  const e = err as NodeJS.ErrnoException & { stderr?: string };
-  const stderr = (e.stderr || "").trim();
-  if (stderr) {
-    const firstLine = stderr.split(/\r?\n/).find((l) => l.trim().length > 0);
-    if (firstLine) return firstLine.replace(/^ERROR:\s*/i, "");
+export function describeYtDlpError(err: unknown): string {
+  if (err == null || typeof err !== "object") {
+    return typeof err === "string" ? err : String(err);
   }
-  return e.message || String(err);
+  const e = err as { stderr?: unknown; message?: unknown };
+  const stderr = typeof e.stderr === "string" ? e.stderr.trim() : "";
+  if (stderr) {
+    const lines = stderr.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    const errorLine = lines.find((l) => /^ERROR:/i.test(l));
+    if (errorLine) return errorLine.replace(/^ERROR:\s*/i, "");
+    const nonWarning = lines.find((l) => !/^WARNING:/i.test(l));
+    if (nonWarning) return nonWarning;
+    if (lines[0]) return lines[0];
+  }
+  return typeof e.message === "string" ? e.message : String(err);
 }
 
 /**
